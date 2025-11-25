@@ -1,106 +1,76 @@
 // api/shopify/webhooks/orders/create.js
 import crypto from "crypto";
 
-/**
- * Hilfsfunktion: den rohen Request-Body einlesen (als String).
- * Vercel parsed hier NICHT automatisch, deswegen lesen wir selbst.
- */
-async function getRawBody(req) {
-  return await new Promise((resolve, reject) => {
-    const chunks = [];
-
-    req.on("data", (chunk) => {
-      chunks.push(chunk);
-    });
-
-    req.on("end", () => {
-      const body = Buffer.concat(chunks).toString("utf8");
-      resolve(body);
-    });
-
-    req.on("error", (err) => {
-      reject(err);
-    });
-  });
-}
-
 export default async function handler(req, res) {
-  // 1) Nur POST erlauben
+  // Shopify always sends POST for webhooks
   if (req.method !== "POST") {
-    return res
-      .status(405)
-      .json({ ok: false, error: "Method not allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
+  // 1) Read raw body exactly as Shopify sent it
+  let rawBody = "";
+  for await (const chunk of req) {
+    rawBody += chunk;
+  }
+
+  const hmacHeader = req.headers["x-shopify-hmac-sha256"];
+
+  // Quick sanity logging (shows up in Vercel logs)
+  console.log("=== Webhook received ===");
+  console.log("Body length:", rawBody.length);
+  console.log(
+    "HMAC header prefix:",
+    hmacHeader ? hmacHeader.slice(0, 10) + "..." : "MISSING"
+  );
+  console.log(
+    "Secret prefix:",
+    process.env.SHOPIFY_API_SECRET
+      ? process.env.SHOPIFY_API_SECRET.slice(0, 8) + "..."
+      : "MISSING"
+  );
+
+  if (!hmacHeader) {
+    console.error("Missing HMAC header");
+    return res.status(401).json({ ok: false, error: "Missing HMAC header" });
+  }
+
+  if (!process.env.SHOPIFY_API_SECRET) {
+    console.error("Missing SHOPIFY_API_SECRET env");
+    return res.status(500).json({ ok: false, error: "Missing app secret" });
+  }
+
+  // 2) Compute digest using the app secret from Shopify
+  const digest = crypto
+    .createHmac("sha256", process.env.SHOPIFY_API_SECRET)
+    .update(rawBody, "utf8")
+    .digest("base64");
+
+  console.log("Computed digest:", digest);
+  console.log("Header HMAC    :", hmacHeader);
+
+  const safeEqual =
+    digest.length === hmacHeader.length &&
+    crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+
+  if (!safeEqual) {
+    console.error("Invalid HMAC", { digest, hmacHeader });
+    return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+  }
+
+  // 3) HMAC is valid → process the webhook
+  let payload;
   try {
-    const secret = process.env.SHOPIFY_API_SECRET;
-
-    if (!secret) {
-      console.error(
-        "SHOPIFY_API_SECRET ist nicht gesetzt – bitte in Vercel Env eintragen."
-      );
-      return res
-        .status(500)
-        .json({ ok: false, error: "Missing SHOPIFY_API_SECRET" });
-    }
-
-    // 2) rohen Body lesen
-    const rawBody = await getRawBody(req);
-
-    // 3) HMAC aus dem Header holen
-    const hmacHeader = req.headers["x-shopify-hmac-sha256"];
-
-    if (!hmacHeader) {
-      console.error("Kein x-shopify-hmac-sha256 Header vorhanden");
-      return res
-        .status(401)
-        .json({ ok: false, error: "Missing HMAC header" });
-    }
-
-    // 4) eigene HMAC-Berechnung
-    const digest = crypto
-      .createHmac("sha256", secret)
-      .update(rawBody, "utf8")
-      .digest("base64");
-
-    if (digest !== hmacHeader) {
-      console.error("Invalid HMAC", { digest, hmacHeader });
-      return res
-        .status(401)
-        .json({ ok: false, error: "Invalid HMAC" });
-    }
-
-    // 5) Ab hier ist der Webhook verifiziert → Payload parsen
-    let payload = null;
-    try {
-      payload = JSON.parse(rawBody);
-    } catch (parseErr) {
-      console.error("Konnte Webhook-Body nicht parsen:", parseErr);
-    }
-
-    // Optional: ein paar Infos loggen
-    if (payload) {
-      console.log("✅ Verifizierter Shopify Order Webhook");
-      console.log(
-        "Shop:",
-        req.headers["x-shopify-shop-domain"] || "unbekannt"
-      );
-      if (payload.id) {
-        console.log("Order ID:", payload.id);
-      }
-    }
-
-    // TODO: Hier kannst du später Base44 / deine App logik aufrufen
-    // z.B. Umsätze tracken, Creator zuordnen usw.
-
-    return res.status(200).json({
-      ok: true,
-      message: "Order webhook received and verified",
-    });
-  } catch (err) {
-    console.error("Fehler im Order-Webhook-Handler:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: err.message });
+    payload = JSON.parse(rawBody);
+  } catch (e) {
+    console.error("Failed to parse webhook JSON", e);
+    return res.status(400).json({ ok: false, error: "Invalid JSON" });
   }
+
+  console.log(
+    `✅ Valid Shopify webhook orders/create for shop ${payload?.order?.name || "unknown"}`
+  );
+
+  // TODO: here you can forward to Base44 or store the order, etc.
+
+  return res.status(200).json({ ok: true });
 }

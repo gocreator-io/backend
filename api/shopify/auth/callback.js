@@ -6,50 +6,67 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  const { shop, code, state } = req.query;
+
+  if (!shop || !code || !state) {
+    return res.status(400).json({
+      error: "Missing 'shop', 'code' or 'state' in callback query",
+    });
+  }
+
+  const clientId = process.env.SHOPIFY_API_KEY;
+  const clientSecret = process.env.SHOPIFY_API_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({
+      error: "Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars",
+    });
+  }
+
+  const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+
   try {
-    const { shop, code, state } = req.query;
-
-    if (!shop || !code) {
-      return res.status(400).json({ error: "Missing shop or code" });
-    }
-
-    // 1) Access Token holen
-    const tokenUrl = `https://${shop}/admin/oauth/access_token`;
-
+    // 1) OAuth-Code gegen Access-Token tauschen
     const tokenResponse = await axios.post(tokenUrl, {
-      client_id: process.env.SHOPIFY_API_KEY,
-      client_secret: process.env.SHOPIFY_API_SECRET,
+      client_id: clientId,
+      client_secret: clientSecret,
       code,
     });
 
     const accessToken = tokenResponse.data.access_token;
     const scope = tokenResponse.data.scope;
 
-    console.log("Shopify OAuth success:", { shop, scope });
-
     if (!accessToken) {
-      return res
-        .status(400)
-        .json({ error: "No access token received from Shopify" });
+      return res.status(400).json({
+        error: "No access token returned from Shopify",
+        raw: tokenResponse.data,
+      });
     }
 
-    // 2) Shop in Base44 speichern
-    const saveUrl = process.env.BASE44_SAVE_STORE_URL;
-    const apiKey = process.env.BASE44_API_KEY; // denselben Key wie bei pingFromBackend
+    console.log("Shopify OAuth success:", {
+      shop,
+      scope,
+      state,
+    });
 
-    if (!saveUrl || !apiKey) {
-      console.error("Missing BASE44_SAVE_STORE_URL or BASE44_API_KEY");
+    // 2) Verbindung in Base44 speichern
+    const base44Url = process.env.BASE44_SAVE_SHOPIFY_URL;
+    const apiKey = process.env.BASE44_API_KEY;
+
+    let base44Result = null;
+
+    if (!base44Url || !apiKey) {
+      console.warn(
+        "BASE44_SAVE_SHOPIFY_URL or BASE44_API_KEY not set – skipping save to Base44"
+      );
     } else {
       try {
-        // TODO: brand_id später dynamisch aus state/Token ableiten
-        const brandId = "demo-brand"; // Platzhalter
-
         const saveResponse = await axios.post(
-          saveUrl,
+          base44Url,
           {
-            brand_id: brandId,
-            shop_domain: shop,
-            access_token: accessToken,
+            brandId: state, // state = brandId aus start.js
+            shop,
+            accessToken,
             scope,
           },
           {
@@ -60,63 +77,31 @@ export default async function handler(req, res) {
           }
         );
 
-        console.log("Base44 saveShopifyStore response:", saveResponse.data);
+        base44Result = saveResponse.data;
+        console.log("Saved Shopify connection in Base44:", base44Result);
       } catch (err) {
         console.error(
-          "Error calling saveShopifyStore:",
+          "Error saving Shopify connection in Base44:",
           err.response?.data || err.message
         );
       }
     }
 
-    // 3) (Optional) Webhooks registrieren
-    try {
-      const topics = [
-        "orders/create",
-        "app/uninstalled",
-        // später: weitere Topics wie price rules etc.
-      ];
-
-      for (const topic of topics) {
-        const webhookRes = await axios.post(
-          `https://${shop}/admin/api/2024-01/webhooks.json`,
-          {
-            webhook: {
-              topic,
-              address: `${process.env.BACKEND_URL}/api/shopify/webhooks`, // Ziel-Route in deinem Backend
-              format: "json",
-            },
-          },
-          {
-            headers: {
-              "X-Shopify-Access-Token": accessToken,
-              "Content-Type": "application/json",
-            },
-          }
-        );
-
-        console.log(
-          `Registered webhook ${topic}:`,
-          webhookRes.data.webhook?.id || "no id"
-        );
-      }
-    } catch (err) {
-      console.error(
-        "Error registering webhooks:",
-        err.response?.data || err.message
-      );
-    }
-
-    // 4) Antwort an den Browser (oder redirect ins Frontend)
+    // 3) Antwort für dich / dein Frontend
     return res.status(200).json({
       ok: true,
       message: "Shopify shop connected successfully",
       shop,
       scope,
+      base44: base44Result,
     });
   } catch (err) {
-    console.error("Shopify OAuth callback error:", err.response?.data || err);
+    console.error(
+      "Shopify OAuth callback error:",
+      err.response?.data || err.message
+    );
     return res.status(500).json({
+      ok: false,
       error: "OAuth callback failed",
       details: err.response?.data || err.message,
     });

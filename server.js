@@ -80,23 +80,38 @@ app.post("/webhooks/orders/create", (req, res) => {
 /* -------------------------------------------------------
     CALL BASE44 PING FUNCTION FROM BACKEND
 --------------------------------------------------------*/
-app.get("/ping-base44", async (req, res) => {
+app.all("/ping-base44", async (req, res) => {
   try {
-    const url = process.env.BASE44_PING_URL; // Your Base44 function endpoint
-    const apiKey = process.env.BASE44_API_KEY; // The key you added in Base44 env
+    const url = process.env.BASE44_PING_URL;   // Base44 function endpoint
+    const apiKey = process.env.BASE44_API_KEY; // Same key as in Base44 env
+
+    console.log("Calling Base44 ping with:", { url, apiKeyPresent: !!apiKey });
 
     const response = await axios.post(
       url,
-      {},
-      { headers: { "x-api-key": apiKey } }
+      { from: "vercel-backend" },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey
+        }
+      }
     );
 
     console.log("Base44 Ping Response:", response.data);
 
-    res.json({ ok: true, base44: response.data });
+    res.status(200).json({
+      ok: true,
+      method: req.method,
+      base44: response.data
+    });
   } catch (err) {
-    console.error("Ping Base44 error:", err.response?.data || err);
-    res.status(500).send("Ping Base44 failed");
+    console.error("Ping Base44 error:", err.response?.data || err.message || err);
+
+    res.status(500).json({
+      ok: false,
+      error: err.response?.data || err.message || "Ping Base44 failed"
+    });
   }
 });
 

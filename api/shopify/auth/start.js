@@ -1,13 +1,14 @@
+// backend/api/shopify/auth/start.js
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { shop } = req.query;
+  const { shop, brandId } = req.query;
 
-  if (!shop) {
+  if (!shop || !brandId) {
     return res.status(400).json({
-      error: "Missing 'shop' query parameter (e.g. ?shop=gocreator-dev.myshopify.com)",
+      error: "Missing 'shop' or 'brandId' query parameter (e.g. ?shop=myshop.myshopify.com&brandId=123)",
     });
   }
 
@@ -23,15 +24,17 @@ export default async function handler(req, res) {
 
   const redirectUri = `${backendUrl}/api/shopify/auth/callback`;
 
-  // Für jetzt ein simpler state – später können wir das pro User signieren
-  const state = `gocreator-${Date.now()}`;
+  // Einfacher State: = brandId (später kannst du hier noch ein CSRF-Token einbauen)
+  const state = brandId;
 
-  const installUrl =
-    `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${encodeURIComponent(apiKey)}` +
-    `&scope=${encodeURIComponent(scopes)}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
+  const params = new URLSearchParams({
+    client_id: apiKey,
+    scope: scopes,
+    redirect_uri: redirectUri,
+    state,
+  });
+
+  const installUrl = `https://${shop}/admin/oauth/authorize?${params.toString()}`;
 
   return res.redirect(installUrl);
 }

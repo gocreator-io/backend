@@ -10,6 +10,7 @@
     "crypto": "^1.0.1",
     "dotenv": "^16.3.1",
     "@base44/sdk": "latest",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "raw-body": "^2.5.2"        
   }
 }

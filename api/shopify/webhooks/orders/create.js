@@ -1,98 +1,101 @@
 // api/shopify/webhooks/orders/create.js
-
 import crypto from "crypto";
-import getRawBody from "raw-body";
-
-const SHOPIFY_SECRET = process.env.SHOPIFY_API_SECRET;
-
-// Optional: Base44-Weiterleitung (nur verwenden, wenn du diese Variablen gesetzt hast)
-const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL; // z.B. https://influence-flow-...base44.app/functions/handleShopifyWebhook
-const BASE44_API_KEY = process.env.BASE44_API_KEY;          // dein x-api-key für Base44
 
 export default async function handler(req, res) {
-  // 1) Nur POST erlauben
+  // 1) Nur POST zulassen
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   try {
-    // 2) Header auslesen
-    const hmacHeader = req.headers["x-shopify-hmac-sha256"] || "";
-    const topic = req.headers["x-shopify-topic"] || "";
-    const shop = req.headers["x-shopify-shop-domain"] || "";
+    // 2) Roh-Body einlesen (ohne vorheriges Parsing)
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const rawBodyBuffer = Buffer.concat(chunks);
+    const rawBodyString = rawBodyBuffer.toString("utf8");
 
-    // 3) Roh-Body als Buffer einlesen
-    const rawBody = await getRawBody(req);
-    console.log("Webhook received", {
-      topic,
-      shop,
-      length: rawBody.length,
-    });
+    // 3) Header + Secret holen
+    const hmacHeader =
+      req.headers["x-shopify-hmac-sha256"] ||
+      req.headers["X-Shopify-Hmac-SHA256".toLowerCase()];
 
-    // 4) HMAC aus Raw-Body berechnen
+    const secret = process.env.SHOPIFY_API_SECRET;
+    if (!secret) {
+      console.error("Missing SHOPIFY_API_SECRET env var");
+      return res.status(500).json({
+        ok: false,
+        error: "Server misconfigured: SHOPIFY_API_SECRET not set",
+      });
+    }
+
+    // Debug-Logging (nur zum Testen)
+    console.log("Webhook received 🌐");
+    console.log("Body length:", rawBodyBuffer.length);
+    console.log("HMAC header:", hmacHeader);
+
+    // 4) HMAC berechnen (WICHTIG: mit Buffer, nicht mit JSON.stringify)
     const digest = crypto
-      .createHmac("sha256", SHOPIFY_SECRET)
-      .update(rawBody)
+      .createHmac("sha256", secret)
+      .update(rawBodyBuffer)
       .digest("base64");
 
-    console.log("Secret prefix:", SHOPIFY_SECRET?.slice(0, 6));
     console.log("Computed digest:", digest);
-    console.log("Header HMAC:", hmacHeader);
 
     // 5) Timing-safe Vergleich
-    const digestBuf = Buffer.from(digest, "utf8");
-    const headerBuf = Buffer.from(hmacHeader, "utf8");
-
-    if (
-      digestBuf.length !== headerBuf.length ||
-      !crypto.timingSafeEqual(digestBuf, headerBuf)
-    ) {
-      console.error("Invalid HMAC:", {
-        digest,
-        hmacHeader,
-      });
-      return res.status(401).json({
-        ok: false,
-        error: "Invalid HMAC",
-      });
+    if (!hmacHeader) {
+      console.error("Missing X-Shopify-Hmac-SHA256 header");
+      return res.status(401).json({ ok: false, error: "Missing HMAC header" });
     }
 
-    // 6) Body jetzt normal parsen
-    const bodyJson = JSON.parse(rawBody.toString("utf8"));
-    console.log("Webhook verified, order payload size:", rawBody.length);
+    const digestBuffer = Buffer.from(digest, "utf8");
+    const headerBuffer = Buffer.from(hmacHeader, "utf8");
 
-    // 7) Optional: an Base44 weiterleiten
-    if (BASE44_WEBHOOK_URL && BASE44_API_KEY) {
-      try {
-        const forwardResp = await fetch(BASE44_WEBHOOK_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": BASE44_API_KEY,
-          },
-          body: JSON.stringify({
-            topic,
-            shop,
-            payload: bodyJson,
-          }),
-        });
-
-        console.log(
-          "Forwarded to Base44, status:",
-          forwardResp.status
-        );
-      } catch (err) {
-        console.error("Error forwarding to Base44:", err);
-      }
+    // Längen angleichen, sonst wirft timingSafeEqual
+    if (digestBuffer.length !== headerBuffer.length) {
+      console.error("HMAC length mismatch");
+      return res.status(401).json({ ok: false, error: "Invalid HMAC" });
     }
 
-    // 8) Shopify erwartet 200, sonst wiederholt es den Webhook
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("Error in orders/create webhook:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Internal server error",
+    const valid = crypto.timingSafeEqual(digestBuffer, headerBuffer);
+
+    if (!valid) {
+      console.error("❌ Invalid HMAC");
+      return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+    }
+
+    console.log("✅ HMAC valid");
+
+    // 6) Payload parsen (jetzt dürfen wir JSON parsen)
+    let payload = null;
+    try {
+      payload = JSON.parse(rawBodyString);
+    } catch (e) {
+      console.error("Failed to parse JSON payload:", e.message);
+      // Payload ist optional – HMAC war ja schon ok.
+    }
+
+    // 7) (Optional) hier kannst du später nach Base44 weiterleiten
+    // if (process.env.BASE44_WEBHOOK_URL) {
+    //   await fetch(process.env.BASE44_WEBHOOK_URL, {
+    //     method: "POST",
+    //     headers: {
+    //       "Content-Type": "application/json",
+    //       // optional: "x-api-key": process.env.BASE44_API_KEY || "",
+    //     },
+    //     body: rawBodyString,
+    //   });
+    // }
+
+    return res.status(200).json({
+      ok: true,
+      message: "Webhook received and HMAC verified",
+      // debug-info:
+      // payload,
     });
+  } catch (err) {
+    console.error("Fatal error in webhook handler:", err);
+    return res.status(500).json({ ok: false, error: "Internal server error" });
   }
 }

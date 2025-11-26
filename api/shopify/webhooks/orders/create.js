@@ -2,13 +2,12 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // 1) Nur POST zulassen
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   try {
-    // 2) Roh-Body einlesen (ohne vorheriges Parsing)
+    // --- 1) Roh-Body einsammeln ---
     const chunks = [];
     for await (const chunk of req) {
       chunks.push(chunk);
@@ -16,67 +15,94 @@ export default async function handler(req, res) {
     const rawBodyBuffer = Buffer.concat(chunks);
     const rawBodyString = rawBodyBuffer.toString("utf8");
 
-    // 3) Header + Secret holen
+    // --- 2) Secret & Header holen ---
+    const rawSecret = process.env.SHOPIFY_API_SECRET || "";
+    const secretTrimmed = rawSecret.trim();
+
     const hmacHeader =
       req.headers["x-shopify-hmac-sha256"] ||
       req.headers["X-Shopify-Hmac-SHA256".toLowerCase()];
 
-    const secret = process.env.SHOPIFY_API_SECRET;
-    if (!secret) {
-      console.error("Missing SHOPIFY_API_SECRET env var");
-      return res.status(500).json({
-        ok: false,
-        error: "Server misconfigured: SHOPIFY_API_SECRET not set",
-      });
-    }
-
-    // Debug-Logging (nur zum Testen)
-    console.log("Webhook received 🌐");
-    console.log("Body length:", rawBodyBuffer.length);
-    console.log("HMAC header:", hmacHeader);
-
-    // 4) HMAC berechnen (WICHTIG: mit Buffer, nicht mit JSON.stringify)
-    const digest = crypto
-      .createHmac("sha256", secret)
-      .update(rawBodyBuffer)
-      .digest("base64");
-
-    console.log("Computed digest:", digest);
-
-    // 5) Timing-safe Vergleich
     if (!hmacHeader) {
       console.error("Missing X-Shopify-Hmac-SHA256 header");
       return res.status(401).json({ ok: false, error: "Missing HMAC header" });
     }
 
-    const digestBuffer = Buffer.from(digest, "utf8");
+    console.log("Webhook received {");
+    console.log("  topic: 'orders/create',");
+    console.log("  shop:", req.headers["x-shopify-shop-domain"] || "?", ",");
+    console.log("  length:", rawBodyBuffer.length, ",");
+    console.log("}");
+    console.log("Secret prefix (raw):", rawSecret.slice(0, 6), "len:", rawSecret.length);
+    console.log("Secret prefix (trim):", secretTrimmed.slice(0, 6), "len:", secretTrimmed.length);
+    console.log("Header HMAC:", hmacHeader);
+
+    // --- 3) Helfer zum HMAC-Berechnen ---
+    const computeDigest = (secret, data, label) => {
+      const d = crypto.createHmac("sha256", secret).update(data).digest("base64");
+      console.log(`Digest [${label}]:`, d);
+      return d;
+    };
+
+    // Wir probieren ein paar realistische Varianten:
+    const candidates = [
+      {
+        label: "buffer + rawSecret",
+        digest: computeDigest(rawSecret, rawBodyBuffer, "buffer + rawSecret"),
+      },
+      {
+        label: "string + rawSecret",
+        digest: computeDigest(rawSecret, rawBodyString, "string + rawSecret"),
+      },
+    ];
+
+    if (secretTrimmed !== rawSecret) {
+      candidates.push(
+        {
+          label: "buffer + trimmedSecret",
+          digest: computeDigest(secretTrimmed, rawBodyBuffer, "buffer + trimmedSecret"),
+        },
+        {
+          label: "string + trimmedSecret",
+          digest: computeDigest(secretTrimmed, rawBodyString, "string + trimmedSecret"),
+        }
+      );
+    }
+
+    // --- 4) Timing-sicher prüfen, ob eine Variante passt ---
     const headerBuffer = Buffer.from(hmacHeader, "utf8");
+    let matchedLabel = null;
 
-    // Längen angleichen, sonst wirft timingSafeEqual
-    if (digestBuffer.length !== headerBuffer.length) {
-      console.error("HMAC length mismatch");
-      return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+    for (const cand of candidates) {
+      const candBuf = Buffer.from(cand.digest, "utf8");
+      if (candBuf.length !== headerBuffer.length) {
+        continue;
+      }
+      if (crypto.timingSafeEqual(candBuf, headerBuffer)) {
+        matchedLabel = cand.label;
+        break;
+      }
     }
 
-    const valid = crypto.timingSafeEqual(digestBuffer, headerBuffer);
-
-    if (!valid) {
-      console.error("❌ Invalid HMAC");
-      return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+    if (!matchedLabel) {
+      console.error("❌ Invalid HMAC – none of the variants matched");
+      return res.status(401).json({
+        ok: false,
+        error: "Invalid HMAC",
+      });
     }
 
-    console.log("✅ HMAC valid");
+    console.log("✅ HMAC valid, matched variant:", matchedLabel);
 
-    // 6) Payload parsen (jetzt dürfen wir JSON parsen)
+    // --- 5) Payload parsen (optional) ---
     let payload = null;
     try {
       payload = JSON.parse(rawBodyString);
     } catch (e) {
-      console.error("Failed to parse JSON payload:", e.message);
-      // Payload ist optional – HMAC war ja schon ok.
+      console.warn("Failed to parse JSON payload (non-fatal):", e.message);
     }
 
-    // 7) (Optional) hier kannst du später nach Base44 weiterleiten
+    // --- 6) (Optional) nach Base44 weiterleiten – später aktivieren ---
     // if (process.env.BASE44_WEBHOOK_URL) {
     //   await fetch(process.env.BASE44_WEBHOOK_URL, {
     //     method: "POST",
@@ -91,8 +117,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       message: "Webhook received and HMAC verified",
-      // debug-info:
-      // payload,
+      matchedVariant: matchedLabel,
     });
   } catch (err) {
     console.error("Fatal error in webhook handler:", err);
